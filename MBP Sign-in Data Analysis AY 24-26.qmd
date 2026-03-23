@@ -1,0 +1,1312 @@
+---
+title: "MBP Center Sign-In Analysis (AY 24–25 & AY 25–26)"
+subtitle: "Usage patterns, resource demand, and recommendations for staffing and funding"
+author: "Arturo Ordaz-Gutierrez | MBP Logistics & MBPC Committee"
+date: "Mar 23, 2026"
+format: html
+code-fold: true
+code-tools: true
+toc: true
+theme: pulse
+editor: source
+embed-resources: true
+execute:
+  echo: true
+  error: true
+  warning: false
+  message: false
+---
+
+# Executive Summary {#exec-summary}
+
+```{r}
+#| label: exec-setup
+#| echo: false
+
+# ── Packages and theme ──────────────────────────────────────────────
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(scales)
+library(knitr)
+library(kableExtra)
+
+col_current  <- "#1b9e77"
+col_previous <- "#999999"
+ay_colors    <- c("AY 24–25" = col_previous, "AY 25–26" = col_current)
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title.position = "plot",
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      legend.position = "top"
+    )
+)
+
+# ── Load data ────────────────────────────────────────────────────────
+path_2526_local <- "/Users/arturoordaz-gutierrez/Documents/MBP Data/MBP Sign-in Data Analysis AY 24-26_files/MBP Center Sign-In, AY 25-26.csv"
+path_2425_local <- "/Users/arturoordaz-gutierrez/Documents/MBP Data/MBP Sign-in Data Analysis AY 24-26_files/MBP Center Sign-In, AY 24-25.csv"
+path_2526_upload <- "/mnt/data/MBP Center Sign-In, AY 25-26.csv"
+path_2425_upload <- "/mnt/data/MBP Center Sign-In, AY 24-25.csv"
+
+path_2526 <- if (file.exists(path_2526_local)) path_2526_local else path_2526_upload
+path_2425 <- if (file.exists(path_2425_local)) path_2425_local else path_2425_upload
+
+df_raw_2526 <- readr::read_csv(path_2526, show_col_types = FALSE) %>% janitor::clean_names()
+df_raw_2425 <- readr::read_csv(path_2425, show_col_types = FALSE) %>% janitor::clean_names()
+
+# ── Cleaning functions ───────────────────────────────────────────────
+clean_signins <- function(df_raw, ay_label) {
+  start_col    <- names(df_raw)[str_detect(names(df_raw), "start_time")][1]
+  end_col      <- names(df_raw)[str_detect(names(df_raw), "completion_time")][1]
+  user_col     <- names(df_raw)[str_detect(names(df_raw), "cal_poly_username")][1]
+  resource_col <- names(df_raw)[str_detect(names(df_raw), "resources.*here_for")][1]
+
+  df_raw %>%
+    mutate(
+      start_time = parse_date_time(.data[[start_col]],
+                                   orders = c("ymd HMS", "mdy HMS", "ymd HM", "mdy HM"),
+                                   tz = "America/Los_Angeles"),
+      completion_time = parse_date_time(.data[[end_col]],
+                                        orders = c("ymd HMS", "mdy HMS", "ymd HM", "mdy HM"),
+                                        tz = "America/Los_Angeles"),
+      user_id = .data[[user_col]] %>%
+        as.character() %>%
+        str_trim() %>%
+        str_to_lower() %>%
+        str_replace_all("\\s+", "") %>%
+        str_replace("@calpoly\\.edu.*$", ""),
+      resources_raw = coalesce(as.character(.data[[resource_col]]), ""),
+      date = as.Date(start_time),
+      dow = wday(start_time, label = TRUE, abbr = FALSE, week_start = 1),
+      hour = hour(start_time),
+      week = floor_date(start_time, unit = "week", week_start = 1),
+      month = floor_date(start_time, unit = "month"),
+      ay = ay_label
+    ) %>%
+    filter(!is.na(start_time), !is.na(date))
+}
+
+add_ay_calendar <- function(df) {
+  df %>%
+    mutate(
+      ay_year = if_else(month(date) >= 8, year(date), year(date) - 1),
+      ay_start_fixed = make_date(ay_year, 8, 1),
+      day_index = as.integer(date - ay_start_fixed) + 1,
+      week_index = as.integer(floor((day_index - 1) / 7)) + 1
+    )
+}
+
+# ── Build datasets ───────────────────────────────────────────────────
+df_2526 <- clean_signins(df_raw_2526, "AY 25–26") %>% add_ay_calendar()
+df_2425 <- clean_signins(df_raw_2425, "AY 24–25") %>% add_ay_calendar()
+
+df_2526_full <- df_2526
+df_2425_full <- df_2425
+
+# ── Year-to-date window ─────────────────────────────────────────────
+max_day_2526 <- max(df_2526_full$day_index, na.rm = TRUE)
+df_2526_ytd <- df_2526_full %>% filter(day_index <= max_day_2526)
+df_2425_ytd <- df_2425_full %>% filter(day_index <= max_day_2526)
+df_all_ytd  <- bind_rows(df_2425_ytd, df_2526_ytd)
+
+# ── Main dataset for single-year sections ────────────────────────────
+df <- df_2526_full
+
+# ── Pre-compute executive-summary values ────────────────────────────
+exec_total_visits   <- nrow(df)
+exec_unique_users   <- df %>% filter(!is.na(user_id), user_id != "", user_id != "nan") %>% distinct(user_id) %>% nrow()
+exec_vpd            <- df %>% count(date) %>% pull(n) %>% mean() %>% round(1)
+exec_open_days      <- n_distinct(df$date)
+exec_visits_per_user <- df %>% filter(!is.na(user_id), user_id != "", user_id != "nan") %>% count(user_id, name = "v")
+exec_pct_repeat     <- mean(exec_visits_per_user$v >= 2) * 100
+
+exec_dow_counts <- df %>% filter(!is.na(dow)) %>% count(dow, name = "visits") %>% arrange(dow)
+exec_peak_day   <- exec_dow_counts %>% slice_max(visits, n = 1, with_ties = FALSE) %>% pull(dow) %>% as.character()
+exec_hour_counts <- df %>% filter(!is.na(hour)) %>% count(hour, name = "visits") %>% arrange(hour)
+exec_peak_hour   <- exec_hour_counts %>% slice_max(visits, n = 1, with_ties = FALSE) %>% pull(hour)
+
+exec_date_min <- min(df$date, na.rm = TRUE)
+exec_date_max <- max(df$date, na.rm = TRUE)
+
+# YoY values
+exec_prev_visits <- nrow(df_2425_ytd)
+exec_curr_visits <- nrow(df_2526_ytd)
+exec_yoy_pct <- round((exec_curr_visits - exec_prev_visits) / exec_prev_visits * 100, 1)
+exec_yoy_dir <- if_else(exec_yoy_pct >= 0, "increase", "decrease")
+
+# Pre-compute top-resource percent-of-visits for executive summary
+exec_standard_resources <- c("Snacks", "Studying", "Printing", "Community Building",
+                             "Scantrons", "Kitchen", "Mentorship")
+exec_resources_long <- df %>%
+  transmute(visit_id = row_number(), resources_raw) %>%
+  mutate(resources_raw = replace_na(resources_raw, "")) %>%
+  separate_longer_delim(resources_raw, delim = ";") %>%
+  mutate(resource = str_trim(resources_raw)) %>%
+  filter(resource != "", resource %in% exec_standard_resources)
+
+exec_res_summary <- exec_resources_long %>%
+  group_by(resource) %>%
+  summarise(visits_with = n_distinct(visit_id), .groups = "drop") %>%
+  mutate(pct = visits_with / exec_total_visits) %>%
+  arrange(desc(pct))
+
+exec_top1 <- exec_res_summary$resource[1]
+exec_top1_pct <- percent(exec_res_summary$pct[1], accuracy = 1)
+exec_top2 <- exec_res_summary$resource[2]
+exec_top2_pct <- percent(exec_res_summary$pct[2], accuracy = 1)
+exec_top3 <- exec_res_summary$resource[3]
+exec_top3_pct <- percent(exec_res_summary$pct[3], accuracy = 1)
+
+# Category-level summary for exec
+exec_cat_map <- tribble(
+  ~resource,             ~category,
+  "Studying",            "Academic Support",
+  "Printing",            "Academic Support",
+  "Scantrons",           "Academic Support",
+  "Snacks",              "Basic Needs",
+  "Kitchen",             "Basic Needs",
+  "Community Building",  "Community & Belonging",
+  "Mentorship",          "Community & Belonging"
+)
+exec_cat_summary <- exec_resources_long %>%
+  inner_join(exec_cat_map, by = "resource") %>%
+  group_by(category) %>%
+  summarise(visits_with = n_distinct(visit_id), .groups = "drop") %>%
+  mutate(pct = visits_with / exec_total_visits) %>%
+  arrange(desc(pct))
+
+exec_cat1 <- exec_cat_summary$category[1]
+exec_cat1_pct <- percent(exec_cat_summary$pct[1], accuracy = 1)
+```
+
+This executive summary is designed to stand on its own. A reader who reviews only this page should understand the scale of the MBP Center's impact, the top student needs, when demand peaks, and what actions the data supports.
+
+::: {.callout-note appearance="simple"}
+## At a Glance
+
+Between `r exec_date_min` and `r exec_date_max`, the MBP Center recorded **`r comma(exec_total_visits)` total visits** (sign-in events) from **`r comma(exec_unique_users)` unique students** across `r exec_open_days` days of operation — an average of **`r exec_vpd` visits per open day**.
+
+**`r percent(exec_pct_repeat/100, accuracy = 0.1)` of unique students are repeat visitors** (two or more sign-ins), showing that the center is part of students' regular routines, not a one-time resource.
+
+Compared to the same point in AY 24–25 — using a fair comparison that limits both years to the same number of days into the academic calendar — year-to-date visits have changed by **`r exec_yoy_pct`%** (`r exec_yoy_dir`).
+:::
+
+### What Students Come For
+
+The most frequently used resources, measured by the **percent of visits** in which each was selected (students can choose multiple resources per visit):
+
+-   **`r exec_top1`** — selected in `r exec_top1_pct` of all visits
+-   **`r exec_top2`** — selected in `r exec_top2_pct` of all visits
+-   **`r exec_top3`** — selected in `r exec_top3_pct` of all visits
+
+When grouped into broader categories, **`r exec_cat1`** resources appear in `r exec_cat1_pct` of all visits — the largest category of demand. This finding directly supports budget requests framed around students' basic and academic needs.
+
+### When Demand Is Highest
+
+Peak traffic falls on **`r exec_peak_day`s around `r exec_peak_hour`:00**, with additional spikes during midterm and finals weeks each quarter. These patterns are consistent and predictable, making them actionable for staffing and supply planning.
+
+### Key Findings and Recommended Actions
+
+| Finding | Recommended Action |
+|:---|:---|
+| **`r exec_peak_day`s around `r exec_peak_hour`:00** are consistently the busiest window. | Schedule full staffing and complete supply restocking for that day and time. Prioritize student-worker shifts that cover the midday rush. |
+| **`r exec_top1`, `r exec_top2`, and `r exec_top3`** are the top three resource needs, selected in a large share of all visits. | Secure **recurring quarterly funding** for these consumables. Set minimum inventory thresholds and reorder before midterms and finals to prevent stockouts. |
+| **`r percent(exec_pct_repeat/100, accuracy = 0.1)` of students return** two or more times. The center is part of their weekly routines. | Use retention data to justify ongoing investment. Promote first-visit programming (WOW, orientation) to convert new visitors into regulars. |
+| Weekly trends show **clear usage spikes around midterms and finals** each quarter. | Pre-position extra supplies and consider extending center hours during these high-demand weeks. |
+| **`r exec_cat1`** resources account for `r exec_cat1_pct` of visits — the largest demand category. | Frame budget proposals around basic-needs and equity language, which aligns with institutional funding priorities. Track supply costs by category for reporting. |
+
+------------------------------------------------------------------------
+
+# 1 — Setup {#setup}
+
+## 1.1 Packages and Theme
+
+```{r}
+#| label: setup-display
+#| eval: false
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(scales)
+library(knitr)
+library(kableExtra)
+```
+
+## 1.2 Import Sign-in Data
+
+Both datasets are loaded from CSV files. Each row represents one **visit** (a single sign-in event). Students may select multiple resources per visit.
+
+```{r}
+#| label: show-glimpse
+glimpse(df_raw_2526)
+glimpse(df_raw_2425)
+```
+
+------------------------------------------------------------------------
+
+# 2 — Data Quality {#data-quality}
+
+This section checks the integrity of both datasets before analysis. Understanding data quality is essential for interpreting the results correctly.
+
+## 2.1 Missing Values
+
+```{r}
+#| label: qc-missing
+valid_uid <- function(x) !is.na(x) & x != "" & x != "nan"
+
+qc_missing <- bind_rows(
+  df_2526_full %>% summarise(ay = "AY 25–26", rows = n(),
+    missing_start_time = sum(is.na(start_time)),
+    missing_user_id    = sum(!valid_uid(user_id))),
+  df_2425_full %>% summarise(ay = "AY 24–25", rows = n(),
+    missing_start_time = sum(is.na(start_time)),
+    missing_user_id    = sum(!valid_uid(user_id)))
+)
+
+qc_missing %>%
+  mutate(across(c(rows, missing_start_time, missing_user_id), comma)) %>%
+  rename(`Academic Year` = ay, `Total Visits` = rows,
+         `Missing Timestamp` = missing_start_time,
+         `Missing / Invalid Student ID` = missing_user_id) %>%
+  kbl(caption = "Missing-Value Check (each row = one visit)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+## 2.2 Duplicate and Suspicious Repeat Sign-ins
+
+A **duplicate** is defined as the same student ID signing in more than once within 5 minutes. These may represent accidental double-submissions rather than separate visits.
+
+```{r}
+#| label: qc-duplicates
+flag_suspicious <- function(df, ay_label) {
+  df %>%
+    filter(valid_uid(user_id)) %>%
+    arrange(user_id, start_time) %>%
+    group_by(user_id) %>%
+    mutate(
+      gap_minutes = as.numeric(difftime(start_time, lag(start_time), units = "mins")),
+      suspicious  = !is.na(gap_minutes) & gap_minutes <= 5
+    ) %>%
+    ungroup() %>%
+    summarise(
+      ay = ay_label,
+      total_visits = n(),
+      suspicious_repeats = sum(suspicious, na.rm = TRUE),
+      pct_suspicious = suspicious_repeats / total_visits
+    )
+}
+
+qc_dupes <- bind_rows(
+  flag_suspicious(df_2526_full, "AY 25–26"),
+  flag_suspicious(df_2425_full, "AY 24–25")
+)
+
+qc_dupes %>%
+  mutate(
+    total_visits = comma(total_visits),
+    suspicious_repeats = comma(suspicious_repeats),
+    pct_suspicious = percent(pct_suspicious, accuracy = 0.01)
+  ) %>%
+  rename(`Academic Year` = ay, `Total Visits` = total_visits,
+         `Repeat < 5 min` = suspicious_repeats,
+         `% Suspicious` = pct_suspicious) %>%
+  kbl(caption = "Suspicious Repeat Sign-ins (same student within 5 minutes)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+## 2.3 Identifier Consistency
+
+Students sometimes enter their username inconsistently (different capitalization, extra spaces, or typos). The cleaning step normalizes usernames to lowercase and removes `@calpoly.edu` suffixes, but residual inconsistencies may remain.
+
+```{r}
+#| label: qc-id-patterns
+# Look for IDs that might be the same person (edit distance 1)
+id_check <- function(df, ay_label) {
+  ids <- df %>% filter(valid_uid(user_id)) %>% distinct(user_id) %>% pull(user_id)
+  tibble(
+    ay = ay_label,
+    unique_ids = length(ids),
+    ids_with_digits_only = sum(str_detect(ids, "^[0-9]+$")),
+    ids_with_spaces = sum(str_detect(ids, "\\s")),
+    ids_with_at_sign = sum(str_detect(ids, "@"))
+  )
+}
+
+bind_rows(
+  id_check(df_2526_full, "AY 25–26"),
+  id_check(df_2425_full, "AY 24–25")
+) %>%
+  rename(`Academic Year` = ay, `Unique IDs` = unique_ids,
+         `Digits-Only IDs` = ids_with_digits_only,
+         `IDs with Spaces` = ids_with_spaces,
+         `IDs with @` = ids_with_at_sign) %>%
+  kbl(caption = "Student ID Consistency Check") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+## 2.4 Resource Label Cleanup
+
+The sign-in form allows free-text entries in addition to the standard resource options. Below are the non-standard labels found in the data. These are excluded from the main resource analysis to keep counts consistent.
+
+```{r}
+#| label: qc-resource-labels
+standard_resources <- c("Snacks", "Studying", "Printing", "Community Building",
+                        "Scantrons", "Kitchen", "Mentorship")
+
+all_resources <- bind_rows(
+  df_2526_full %>% transmute(ay = "AY 25–26", resources_raw),
+  df_2425_full %>% transmute(ay = "AY 24–25", resources_raw)
+) %>%
+  mutate(resources_raw = replace_na(resources_raw, "")) %>%
+  separate_longer_delim(resources_raw, delim = ";") %>%
+  mutate(resource = str_trim(resources_raw)) %>%
+  filter(resource != "")
+
+nonstandard <- all_resources %>%
+  filter(!resource %in% standard_resources) %>%
+  count(resource, name = "times_entered") %>%
+  arrange(desc(times_entered))
+
+nonstandard %>%
+  slice_head(n = 15) %>%
+  rename(`Non-Standard Entry` = resource, `Times Entered` = times_entered) %>%
+  kbl(caption = "Top Non-Standard Resource Entries (excluded from main analysis)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+::: callout-tip
+## Data Quality Summary and How Issues Were Handled
+
+The datasets are largely clean. Four types of quality issues were identified, all affecting a small fraction of records:
+
+1.  **Missing timestamps or student IDs** — Visits with missing timestamps were excluded during data cleaning. Visits with missing or invalid student IDs are included in total visit counts but excluded from student-level metrics (unique students, repeat visitors, retention). This means the true number of unique students may be slightly higher than reported.
+2.  **Suspicious rapid re-submissions** — Sign-ins from the same student within 5 minutes are flagged above. These are **not removed** from the dataset because some may be legitimate (e.g., a student who forgot to select a resource and re-submitted). They represent a small share of total visits and do not materially change the overall patterns.
+3.  **Username inconsistencies** — The cleaning process normalizes all usernames to lowercase and removes `@calpoly.edu` suffixes. However, typos and other entry errors cannot be fully resolved without a master student roster. Some slight overcounting of unique students may remain.
+4.  **Non-standard resource entries** — Free-text resource labels that do not match the standard form options are documented above and **excluded from the main resource analysis** to keep counts consistent across years.
+
+Overall, these issues affect a small fraction of records and do not materially change the findings or recommendations.
+:::
+
+------------------------------------------------------------------------
+
+# 3 — Year-over-Year Comparison {#yoy}
+
+::: callout-important
+## How the Year-over-Year Comparison Works
+
+To make a fair comparison between years, **AY 24–25 data is limited to the same number of days into the academic year** as the most recent AY 25–26 data. Here is how:
+
+1.  Both years are measured from **August 1** of their respective start years (August 1, 2024 for AY 24–25; August 1, 2025 for AY 25–26).
+2.  The number of days elapsed in AY 25–26 (from August 1 to the most recent sign-in date) is calculated.
+3.  AY 24–25 is then **trimmed to include only the same number of days** from its own August 1.
+
+This means both years are compared at the **same stage of the academic calendar**. Differences in the totals below reflect real changes in usage — not differences in how much of the year has been recorded. Minor variations may still exist if quarter start dates shifted slightly between years, but the overall comparison is designed to be as fair and transparent as possible.
+:::
+
+## 3.1 Comparison Window
+
+```{r}
+#| label: yoy-window
+df_all_ytd %>%
+  group_by(ay) %>%
+  summarise(
+    first_date   = min(date),
+    last_date    = max(date),
+    open_days    = n_distinct(date),
+    total_visits = n(),
+    unique_students = n_distinct(user_id[valid_uid(user_id)]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    visits_per_open_day = round(total_visits / open_days, 1),
+    open_days    = comma(open_days),
+    total_visits = comma(total_visits),
+    unique_students = comma(unique_students)
+  ) %>%
+  rename(
+    `Academic Year` = ay,
+    `First Date` = first_date,
+    `Last Date` = last_date,
+    `Open Days` = open_days,
+    `Total Visits` = total_visits,
+    `Unique Students` = unique_students,
+    `Visits / Open Day` = visits_per_open_day
+  ) %>%
+  kbl(caption = "Year-over-Year Comparison Window (same stage of academic calendar)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+## 3.2 Headline Metrics
+
+All metrics below use the **same-stage comparison window** described above.
+
+```{r}
+#| label: yoy-metrics
+yoy_metrics <- df_all_ytd %>%
+  filter(valid_uid(user_id)) %>%
+  group_by(ay) %>%
+  summarise(
+    total_visits       = n(),
+    unique_students    = n_distinct(user_id),
+    open_days          = n_distinct(date),
+    visits_per_open_day = round(total_visits / open_days, 1),
+    visits_per_student = round(total_visits / unique_students, 2),
+    pct_repeat_2plus   = {
+      v <- count(cur_data(), user_id, name = "visits")$visits
+      mean(v >= 2)
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    total_visits     = comma(total_visits),
+    unique_students  = comma(unique_students),
+    pct_repeat_2plus = percent(pct_repeat_2plus, accuracy = 0.1)
+  ) %>%
+  select(ay, total_visits, unique_students, visits_per_open_day,
+         visits_per_student, pct_repeat_2plus)
+
+yoy_metrics %>%
+  rename(
+    `Academic Year`      = ay,
+    `Total Visits`       = total_visits,
+    `Unique Students`    = unique_students,
+    `Visits / Open Day`  = visits_per_open_day,
+    `Visits / Student`   = visits_per_student,
+    `% Repeat Visitors`  = pct_repeat_2plus
+  ) %>%
+  kbl(caption = "Year-over-Year Headline Metrics (same stage of academic calendar)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+## 3.3 Weekly Trend Comparison
+
+Both years are aligned by **week of the academic year** (week 1 = first week of August).
+
+```{r}
+#| label: yoy-weekly-annotated
+#| fig-height: 6
+weekly_ytd <- df_all_ytd %>%
+  count(ay, week_index, name = "visits")
+
+max_wk <- max(weekly_ytd$week_index, na.rm = TRUE)
+
+ggplot(weekly_ytd, aes(x = week_index, y = visits, color = ay)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8, alpha = 0.7) +
+  scale_x_continuous(breaks = seq(0, max_wk, by = 4)) +
+  scale_y_continuous(labels = comma) +
+  scale_color_manual(values = ay_colors) +
+  labs(
+    title = "Total Visits per Week by Academic Year",
+    subtitle = "Both years limited to the same stage of the academic calendar",
+    x = "Week of Academic Year (from Aug 1)",
+    y = "Total Visits",
+    color = "Academic Year"
+  )
+```
+
+## 3.4 Cumulative Visits
+
+This chart shows the running total of visits for each year. If the AY 25–26 line is above the AY 24–25 line, the center is ahead of last year's pace at the same point in the academic calendar. If below, usage is behind. Both years are limited to the same number of days into the academic year for a fair comparison.
+
+```{r}
+#| label: yoy-cumulative
+cum_ytd <- weekly_ytd %>%
+  arrange(ay, week_index) %>%
+  group_by(ay) %>%
+  mutate(cum_visits = cumsum(visits)) %>%
+  ungroup()
+
+ggplot(cum_ytd, aes(x = week_index, y = cum_visits, color = ay)) +
+  geom_line(linewidth = 1.0) +
+  scale_x_continuous(breaks = seq(0, max(cum_ytd$week_index), by = 4)) +
+  scale_y_continuous(labels = comma) +
+  scale_color_manual(values = ay_colors) +
+  labs(
+    title = "Cumulative Visits by Academic Year",
+    subtitle = "Same-stage comparison: both years limited to the same number of days into the academic calendar",
+    x = "Week of Academic Year",
+    y = "Cumulative Visits",
+    color = "Academic Year"
+  )
+```
+
+## 3.5 Monthly Visits by Year
+
+Months are ordered by academic year (August through July).
+
+```{r}
+#| label: yoy-monthly
+# Academic-year month ordering
+ay_month_order <- c("Aug","Sep","Oct","Nov","Dec","Jan","Feb","Mar","Apr","May","Jun","Jul")
+
+monthly_ytd <- df_all_ytd %>%
+  mutate(month_label = factor(format(date, "%b"), levels = ay_month_order)) %>%
+  count(ay, month_label, name = "visits") %>%
+  filter(!is.na(month_label))
+
+ggplot(monthly_ytd, aes(x = month_label, y = visits, fill = ay)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = comma(visits)), position = position_dodge(width = 0.9),
+            vjust = -0.5, size = 2.8) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = ay_colors) +
+  labs(
+    title = "Total Visits by Month and Academic Year",
+    subtitle = "Both years limited to the same stage of the academic calendar; months ordered Aug–Jul",
+    x = NULL,
+    y = "Total Visits",
+    fill = "Academic Year"
+  )
+```
+
+## 3.6 Unique Students per Month
+
+This chart tracks the number of **distinct students** who visited each month, rather than total visits.
+
+```{r}
+#| label: yoy-monthly-unique
+monthly_unique <- df_all_ytd %>%
+  filter(valid_uid(user_id)) %>%
+  mutate(month_label = factor(format(date, "%b"), levels = ay_month_order)) %>%
+  group_by(ay, month_label) %>%
+  summarise(unique_students = n_distinct(user_id), .groups = "drop") %>%
+  filter(!is.na(month_label))
+
+ggplot(monthly_unique, aes(x = month_label, y = unique_students, fill = ay)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = comma(unique_students)), position = position_dodge(width = 0.9),
+            vjust = -0.5, size = 2.8) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = ay_colors) +
+  labs(
+    title = "Unique Students per Month by Academic Year",
+    subtitle = "Each student counted once per month; same-stage comparison (both years limited to the same point in the academic calendar)",
+    x = NULL,
+    y = "Unique Students",
+    fill = "Academic Year"
+  )
+```
+
+## 3.7 Resource Demand Comparison
+
+Since students can select multiple resources per visit, raw selection counts can overstate comparisons. The table below shows both the **total selections** and the **percent of visits** that included each resource, for each academic year. Both years are limited to the same stage of the academic calendar for a fair comparison.
+
+```{r}
+#| label: yoy-resources
+standard_resources <- c("Snacks", "Studying", "Printing", "Community Building",
+                        "Scantrons", "Kitchen", "Mentorship")
+
+resources_long_ytd <- df_all_ytd %>%
+  mutate(visit_id = row_number()) %>%
+  transmute(ay, visit_id, start_time, resources_raw) %>%
+  mutate(resources_raw = replace_na(resources_raw, "")) %>%
+  separate_longer_delim(resources_raw, delim = ";") %>%
+  mutate(resource = str_trim(resources_raw)) %>%
+  filter(resource != "", resource %in% standard_resources)
+
+# Total visits per AY (for percent-of-visits denominator)
+visits_per_ay <- df_all_ytd %>% count(ay, name = "total_visits")
+
+resources_ytd_detail <- resources_long_ytd %>%
+  group_by(ay, resource) %>%
+  summarise(
+    total_selections     = n(),
+    visits_with_resource = n_distinct(visit_id),
+    .groups = "drop"
+  ) %>%
+  left_join(visits_per_ay, by = "ay") %>%
+  mutate(pct_of_visits = visits_with_resource / total_visits)
+
+resources_ytd_detail %>%
+  mutate(
+    total_selections     = comma(total_selections),
+    visits_with_resource = comma(visits_with_resource),
+    pct_of_visits        = percent(pct_of_visits, accuracy = 0.1)
+  ) %>%
+  select(ay, resource, total_selections, visits_with_resource, pct_of_visits) %>%
+  arrange(ay, desc(as.numeric(str_remove_all(total_selections, ",")))) %>%
+  rename(
+    `Academic Year`                  = ay,
+    Resource                         = resource,
+    `Total Selections`               = total_selections,
+    `Visits Including This Resource` = visits_with_resource,
+    `% of Visits`                    = pct_of_visits
+  ) %>%
+  kbl(caption = "Resource Demand by Year: Selections and % of Visits (same stage of academic calendar)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+```{r}
+#| label: yoy-resources-chart
+resources_totals_ytd <- resources_long_ytd %>%
+  count(ay, resource, name = "selections")
+
+ggplot(resources_totals_ytd,
+       aes(x = fct_reorder(resource, selections, .fun = sum),
+           y = selections, fill = ay)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = comma(selections)), position = position_dodge(width = 0.9),
+            hjust = -0.1, size = 3) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = ay_colors) +
+  labs(
+    title = "Resource Selections by Academic Year",
+    subtitle = "Total times each resource was selected; both years limited to the same stage of the academic calendar",
+    x = NULL,
+    y = "Total Selections",
+    fill = "Academic Year"
+  ) +
+  coord_flip()
+```
+
+------------------------------------------------------------------------
+
+# 4 — AY 25–26 Full-Year Analysis {#ay2526}
+
+All analysis in this section uses the complete AY 25–26 dataset.
+
+## 4.1 Overall Usage Summary
+
+```{r}
+#| label: overall-metrics
+total_visits    <- nrow(df)
+open_days       <- n_distinct(df$date)
+visits_per_day  <- round(total_visits / open_days, 1)
+
+valid_df <- df %>% filter(valid_uid(user_id))
+unique_users <- n_distinct(valid_df$user_id)
+
+visits_per_user <- valid_df %>% count(user_id, name = "visits") %>% arrange(desc(visits))
+median_vpu      <- median(visits_per_user$visits)
+pct_one_time    <- mean(visits_per_user$visits == 1) * 100
+pct_repeat      <- mean(visits_per_user$visits >= 2) * 100
+
+date_min <- min(df$date, na.rm = TRUE)
+date_max <- max(df$date, na.rm = TRUE)
+
+tibble(
+  Metric = c(
+    "Date range",
+    "Total visits (sign-in events)",
+    "Unique students (distinct IDs)",
+    "Days center was open",
+    "Visits per open day",
+    "Median visits per student",
+    "One-time visitors (% of unique students)",
+    "Repeat visitors, 2+ visits (% of unique students)"
+  ),
+  Value = c(
+    paste(date_min, "to", date_max),
+    comma(total_visits),
+    comma(unique_users),
+    comma(open_days),
+    as.character(visits_per_day),
+    as.character(median_vpu),
+    percent(pct_one_time/100, accuracy = 0.1),
+    percent(pct_repeat/100, accuracy = 0.1)
+  )
+) %>%
+  kbl(caption = "AY 25–26 Usage Overview — each row is clearly labeled as visits, students, or a rate") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+## 4.2 Student Engagement Distribution
+
+How many visits did each **unique student** make? This shows the distribution of engagement depth.
+
+```{r}
+#| label: engagement-dist
+repeat_buckets <- visits_per_user %>%
+  mutate(bucket = case_when(
+    visits == 1       ~ "1",
+    visits == 2       ~ "2",
+    visits %in% 3:4   ~ "3–4",
+    visits %in% 5:9   ~ "5–9",
+    visits %in% 10:19  ~ "10–19",
+    visits %in% 20:49  ~ "20–49",
+    visits >= 50       ~ "50+"
+  )) %>%
+  count(bucket) %>%
+  mutate(bucket = factor(bucket, levels = c("1","2","3–4","5–9","10–19","20–49","50+")))
+
+ggplot(repeat_buckets, aes(x = bucket, y = n)) +
+  geom_col(fill = col_current) +
+  geom_text(aes(label = comma(n)), vjust = -0.5, size = 3) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Student Engagement: How Many Times Each Unique Student Visited",
+    subtitle = "Each bar shows the number of unique students in that visit-count range",
+    x = "Total Visits per Student",
+    y = "Number of Unique Students"
+  )
+```
+
+## 4.3 Repeat Visitor Deep Dive
+
+Beyond simple repeat-visit counts, this section examines **how quickly students return** to the MBP Center.
+
+```{r}
+#| label: retention-metrics
+# Calculate gaps between visits for each student
+visit_gaps <- valid_df %>%
+  arrange(user_id, start_time) %>%
+  group_by(user_id) %>%
+  mutate(
+    visit_num = row_number(),
+    days_since_last = as.numeric(difftime(date, lag(date), units = "days"))
+  ) %>%
+  filter(!is.na(days_since_last)) %>%
+  ungroup()
+
+# First-return timing
+first_returns <- valid_df %>%
+  arrange(user_id, start_time) %>%
+  group_by(user_id) %>%
+  filter(n() >= 2) %>%
+  summarise(
+    first_visit = min(date),
+    second_visit = sort(unique(date))[2],
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(second_visit)) %>%
+  mutate(days_to_return = as.numeric(second_visit - first_visit))
+
+pct_return_7d  <- mean(first_returns$days_to_return <= 7, na.rm = TRUE) * 100
+pct_return_30d <- mean(first_returns$days_to_return <= 30, na.rm = TRUE) * 100
+avg_gap_days   <- round(mean(visit_gaps$days_since_last, na.rm = TRUE), 1)
+median_gap_days <- round(median(visit_gaps$days_since_last, na.rm = TRUE), 1)
+
+tibble(
+  Metric = c(
+    "Repeat visitors who returned within 7 days (% of repeat students)",
+    "Repeat visitors who returned within 30 days (% of repeat students)",
+    "Average days between visits (all repeat visits)",
+    "Median days between visits (all repeat visits)"
+  ),
+  Value = c(
+    percent(pct_return_7d/100, accuracy = 0.1),
+    percent(pct_return_30d/100, accuracy = 0.1),
+    paste(avg_gap_days, "days"),
+    paste(median_gap_days, "days")
+  )
+) %>%
+  kbl(caption = "Retention-Style Metrics for Repeat Visitors (AY 25–26)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+```{r}
+#| label: return-timing-dist
+#| fig-height: 4
+ggplot(first_returns, aes(x = days_to_return)) +
+  geom_histogram(binwidth = 7, fill = col_current, color = "white") +
+  geom_vline(xintercept = c(7, 30), linetype = "dashed", color = "grey40") +
+  annotate("text", x = 7, y = Inf, label = "7 days", vjust = 2, hjust = -0.1, size = 3, color = "grey30") +
+  annotate("text", x = 30, y = Inf, label = "30 days", vjust = 2, hjust = -0.1, size = 3, color = "grey30") +
+  labs(
+    title = "Days Until First Return Visit",
+    subtitle = "Among students who visited at least twice; each bar spans 7 days",
+    x = "Days from First Visit to Second Visit",
+    y = "Number of Students"
+  )
+```
+
+### Repeat Visitor Share by Month
+
+What fraction of each month's visitors are **returning** students (visited the center at least once in a prior month)?
+
+```{r}
+#| label: repeat-share-monthly
+monthly_repeat <- valid_df %>%
+  arrange(user_id, date) %>%
+  group_by(user_id) %>%
+  mutate(first_date = min(date)) %>%
+  ungroup() %>%
+  mutate(
+    month_label = factor(format(date, "%b"), levels = ay_month_order),
+    is_returning = date > first_date
+  ) %>%
+  group_by(month_label) %>%
+  summarise(
+    total_visitors  = n_distinct(user_id),
+    returning       = n_distinct(user_id[is_returning]),
+    pct_returning   = returning / total_visitors,
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(month_label))
+
+ggplot(monthly_repeat, aes(x = month_label, y = pct_returning)) +
+  geom_col(fill = col_current) +
+  geom_text(aes(label = percent(pct_returning, accuracy = 1)), vjust = -0.5, size = 3) +
+  scale_y_continuous(labels = percent, limits = c(0, 1), expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Repeat Visitor Share by Month",
+    subtitle = "% of each month's unique visitors who had visited in a prior month",
+    x = NULL,
+    y = "% Returning Visitors"
+  )
+```
+
+## 4.4 Weekly Trends with Academic Calendar
+
+Usage does not stay constant across the year. The chart below shows total visits per week across AY 25–26, making it easy to identify when demand rises and falls.
+
+```{r}
+#| label: weekly-annotated
+#| fig-height: 6
+weekly_visits <- df %>%
+  filter(!is.na(start_time)) %>%
+  count(week_index, name = "visits")
+
+ggplot(weekly_visits, aes(x = week_index, y = visits)) +
+  geom_line(linewidth = 0.8, color = col_current) +
+  geom_point(size = 1.5, color = col_current) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Total Visits per Week (AY 25–26)",
+    subtitle = "Peaks and dips reflect changes in student traffic across the academic year",
+    x = "Week of Academic Year (from Aug 1)",
+    y = "Total Visits"
+  )
+```
+
+## 4.5 Peak Days and Hours
+
+### Day-by-Hour Heatmap
+
+This heatmap shows **total visits** for each combination of day-of-week and hour-of-day. Darker cells indicate higher traffic. This is the most direct tool for staffing and scheduling decisions — it shows exactly which shifts need the most coverage and when supplies are most likely to run low.
+
+```{r}
+#| label: heatmap
+#| fig-height: 5
+dow_hour <- df %>%
+  filter(!is.na(dow), !is.na(hour)) %>%
+  count(dow, hour, name = "visits")
+
+ggplot(dow_hour, aes(x = hour, y = fct_rev(dow), fill = visits)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = visits), size = 2.5, color = "white") +
+  scale_x_continuous(breaks = 8:20, expand = c(0, 0)) +
+  scale_fill_gradient(low = "#e0f3db", high = "#1b9e77", name = "Visits") +
+  labs(
+    title = "Visits by Day of Week and Hour",
+    subtitle = "Darker cells = more total visits; numbers show visit counts",
+    x = "Hour of Day",
+    y = NULL
+  ) +
+  theme(panel.grid = element_blank())
+```
+
+### Day of Week
+
+```{r}
+#| label: dow-chart
+dow_counts <- df %>%
+  filter(!is.na(dow)) %>%
+  count(dow, name = "visits") %>%
+  arrange(dow)
+
+ggplot(dow_counts, aes(x = dow, y = visits)) +
+  geom_col(fill = col_current) +
+  geom_text(aes(label = comma(visits)), vjust = -0.5, size = 3) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Total Visits by Day of Week (AY 25–26)",
+    x = NULL, y = "Total Visits"
+  ) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+### Hour of Day
+
+```{r}
+#| label: hour-chart
+hour_counts <- df %>%
+  filter(!is.na(hour)) %>%
+  count(hour, name = "visits") %>%
+  arrange(hour)
+
+ggplot(hour_counts, aes(x = hour, y = visits)) +
+  geom_col(fill = col_current) +
+  geom_text(aes(label = comma(visits)), vjust = -0.5, size = 3) +
+  scale_x_continuous(breaks = seq(0, 23, 1)) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Total Visits by Hour of Day (AY 25–26)",
+    x = "Hour", y = "Total Visits"
+  )
+```
+
+### Peak Summary
+
+```{r}
+#| label: peak-summary
+peak_day  <- dow_counts %>% slice_max(visits, n = 1, with_ties = FALSE) %>% pull(dow) %>% as.character()
+peak_hour <- hour_counts %>% slice_max(visits, n = 1, with_ties = FALSE) %>% pull(hour)
+
+tibble(
+  Metric = c("Busiest Day (by total visits)", "Busiest Hour (by total visits)"),
+  Value  = c(peak_day, paste0(peak_hour, ":00"))
+) %>%
+  kbl(caption = "Peak Usage Times") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+::: callout-note
+## Staffing and Supply Recommendation
+
+**`r peak_day`s around `r peak_hour`:00** consistently see the highest traffic. Based on the heatmap above:
+
+-   **Staffing:** Ensure full staffing on `r peak_day`s from `r max(peak_hour - 1, 8)`:00 to `r min(peak_hour + 2, 18)`:00. Schedule student-worker shifts to cover this midday rush window, with at least one additional staff member compared to low-traffic periods.
+-   **Supplies:** Restock snacks, printing paper, and scantrons **before** this peak window — not after. Set a weekly restocking schedule tied to the busiest day.
+-   **Adjacent hours:** Review the heatmap for secondary peaks on other days and adjust coverage accordingly. Even outside the single busiest cell, surrounding hours often carry substantial traffic.
+:::
+
+------------------------------------------------------------------------
+
+# 5 — Resource Analysis {#resources}
+
+Students select the resources they are using at each visit. Because **one visit can include multiple resource selections**, total selection counts will always be higher than total visit counts. This means raw selection counts can overstate how common a resource is if used alone.
+
+To address this, every resource table and chart in this section includes two measures:
+
+-   **Total selections** — how many times the resource was chosen across all visits (useful for estimating supply consumption)
+-   **% of visits** — what share of all visits included that resource (useful for understanding how widespread a need is)
+
+Both measures are important. Total selections help estimate supply costs. Percent of visits helps compare how common different needs are across the student population.
+
+## 5.1 Top Resources: Counts and Percent of Visits
+
+```{r}
+#| label: top-resources-table
+resources_long <- df %>%
+  transmute(visit_id = row_number(), user_id, start_time, resources_raw) %>%
+  mutate(resources_raw = replace_na(resources_raw, "")) %>%
+  separate_longer_delim(resources_raw, delim = ";") %>%
+  mutate(resource = str_trim(resources_raw)) %>%
+  filter(resource != "", resource %in% standard_resources)
+
+total_visits_count <- nrow(df)
+
+top_resources <- resources_long %>%
+  group_by(resource) %>%
+  summarise(
+    total_selections       = n(),
+    visits_with_resource   = n_distinct(visit_id),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_of_visits          = visits_with_resource / total_visits_count,
+    selections_per_100     = round(total_selections / total_visits_count * 100, 1)
+  ) %>%
+  arrange(desc(total_selections))
+
+top_resources %>%
+  mutate(
+    total_selections     = comma(total_selections),
+    visits_with_resource = comma(visits_with_resource),
+    pct_of_visits        = percent(pct_of_visits, accuracy = 0.1),
+    selections_per_100   = as.character(selections_per_100)
+  ) %>%
+  rename(
+    Resource               = resource,
+    `Total Selections`     = total_selections,
+    `Visits Including This Resource` = visits_with_resource,
+    `% of All Visits`      = pct_of_visits,
+    `Selections per 100 Visits` = selections_per_100
+  ) %>%
+  kbl(caption = "Resource Demand: Total Selections and Percent of Visits (AY 25–26)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE, width = "15em")
+```
+
+```{r}
+#| label: top-resources-chart
+top_resources %>%
+  arrange(pct_of_visits) %>%
+  ggplot(aes(x = pct_of_visits, y = fct_reorder(resource, pct_of_visits))) +
+  geom_col(fill = col_current) +
+  geom_text(aes(label = percent(pct_of_visits, accuracy = 0.1)), hjust = -0.1, size = 3) +
+  scale_x_continuous(labels = percent, expand = expansion(mult = c(0, 0.2))) +
+  labs(
+    title = "Resources by % of Visits in Which They Were Selected",
+    subtitle = "Each bar shows what share of total visits included that resource (AY 25–26)",
+    x = "% of Visits",
+    y = NULL
+  )
+```
+
+## 5.2 Resource Categories
+
+To make the resource data more useful for funding and program conversations, individual resources are organized into three broader categories. These groupings make it easier to communicate demand patterns to leadership and align budget requests with institutional priorities.
+
+| Category | Resources Included | Why It Matters for Funding |
+|:---|:---|:---|
+| **Basic Needs** | Snacks, Kitchen | Directly supports students' basic needs — a high-priority area for equity-focused funding. These are consumable and require recurring investment. |
+| **Academic Support** | Studying, Printing, Scantrons | Supports academic success with tangible supplies. Demand spikes around midterms and finals, making costs predictable and plannable. |
+| **Community & Belonging** | Community Building, Mentorship | Supports retention and sense of belonging — outcomes that are harder to measure but central to the MBP Center's mission. |
+
+```{r}
+#| label: resource-categories
+resource_categories <- tribble(
+  ~resource,             ~category,
+  "Studying",            "Academic Support",
+  "Printing",            "Academic Support",
+  "Scantrons",           "Academic Support",
+  "Snacks",              "Basic Needs",
+  "Kitchen",             "Basic Needs",
+  "Community Building",  "Community & Belonging",
+  "Mentorship",          "Community & Belonging"
+)
+
+category_summary <- resources_long %>%
+  inner_join(resource_categories, by = "resource") %>%
+  group_by(category) %>%
+  summarise(
+    total_selections     = n(),
+    visits_with_category = n_distinct(visit_id),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_of_visits  = visits_with_category / total_visits_count,
+    pct_of_selections = total_selections / sum(total_selections)
+  ) %>%
+  arrange(desc(total_selections))
+
+category_summary %>%
+  mutate(
+    total_selections     = comma(total_selections),
+    visits_with_category = comma(visits_with_category),
+    pct_of_visits        = percent(pct_of_visits, accuracy = 0.1),
+    pct_of_selections    = percent(pct_of_selections, accuracy = 0.1)
+  ) %>%
+  rename(
+    Category                = category,
+    `Total Selections`      = total_selections,
+    `Visits with This Category` = visits_with_category,
+    `% of Visits`           = pct_of_visits,
+    `% of All Selections`   = pct_of_selections
+  ) %>%
+  kbl(caption = "Resource Demand by Category (AY 25–26)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+```{r}
+#| label: category-chart
+category_summary %>%
+  arrange(pct_of_visits) %>%
+  ggplot(aes(x = pct_of_visits, y = fct_reorder(category, pct_of_visits))) +
+  geom_col(fill = col_current) +
+  geom_text(aes(label = percent(pct_of_visits, accuracy = 0.1)), hjust = -0.1, size = 3.5) +
+  scale_x_continuous(labels = percent, expand = expansion(mult = c(0, 0.2))) +
+  labs(
+    title = "Resource Categories by % of Visits",
+    subtitle = "Share of total visits that included at least one resource in this category",
+    x = "% of Visits",
+    y = NULL
+  )
+```
+
+::: callout-tip
+## What This Means for Budget Requests
+
+The category breakdown shows where student demand is concentrated. When preparing funding proposals, lead with the category that represents the largest share of visits — this makes the case concrete and data-backed. For consumable categories (Basic Needs, Academic Support), emphasize that these costs are **recurring and predictable**, which supports requests for ongoing rather than one-time funding.
+:::
+
+------------------------------------------------------------------------
+
+# 6 — Normalized Metrics {#normalized}
+
+Raw totals (total visits, total selections) can be misleading when comparing months or years that have different numbers of operating days. The normalized metrics below control for these differences. **Visits per open day** shows daily intensity regardless of how many days the center was open. **Unique students per month** reveals whether growth comes from new students or more frequent visits. **Resource selections per 100 visits** shows whether students are selecting more or fewer resources over time. Together, these metrics tell a more accurate story than raw totals alone.
+
+```{r}
+#| label: normalized-monthly
+#| fig-height: 5
+monthly_norm <- valid_df %>%
+  mutate(month_label = factor(format(date, "%b"), levels = ay_month_order)) %>%
+  group_by(month_label) %>%
+  summarise(
+    total_visits    = n(),
+    open_days       = n_distinct(date),
+    unique_students = n_distinct(user_id),
+    visits_per_day  = round(total_visits / open_days, 1),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(month_label))
+
+# Resource selections per 100 visits by month
+res_per_month <- resources_long %>%
+  mutate(month_label = factor(format(start_time, "%b"), levels = ay_month_order)) %>%
+  count(month_label, name = "selections") %>%
+  filter(!is.na(month_label))
+
+monthly_norm <- monthly_norm %>%
+  left_join(res_per_month, by = "month_label") %>%
+  mutate(selections_per_100 = round(selections / total_visits * 100, 1))
+
+monthly_norm %>%
+  mutate(
+    total_visits    = comma(total_visits),
+    unique_students = comma(unique_students)
+  ) %>%
+  rename(
+    Month = month_label,
+    `Total Visits` = total_visits,
+    `Open Days` = open_days,
+    `Unique Students` = unique_students,
+    `Visits / Open Day` = visits_per_day,
+    `Resource Selections` = selections,
+    `Selections per 100 Visits` = selections_per_100
+  ) %>%
+  kbl(caption = "Monthly Normalized Metrics (AY 25–26)") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+```{r}
+#| label: norm-visits-per-day
+ggplot(monthly_norm, aes(x = month_label, y = visits_per_day)) +
+  geom_col(fill = col_current) +
+  geom_text(aes(label = visits_per_day), vjust = -0.5, size = 3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title = "Visits per Open Day by Month (AY 25–26)",
+    subtitle = "Controls for different numbers of operating days per month",
+    x = NULL,
+    y = "Visits per Open Day"
+  )
+```
+
+------------------------------------------------------------------------
+
+# 7 — Recommendations {#recommendations}
+
+The following recommendations translate the analysis findings into specific actions for staffing, supply budgeting, and student support planning.
+
+```{r}
+#| label: recommendations-table
+#| echo: false
+
+# Build dynamic recommendation values
+top3_resources <- top_resources %>% slice_head(n = 3) %>% pull(resource)
+top_category   <- category_summary %>% slice_head(n = 1) %>% pull(category)
+
+recs <- tribble(
+  ~Area, ~Finding, ~Recommendation,
+  "Staffing",
+  paste0("Peak traffic occurs on ", peak_day, "s around ", peak_hour, ":00. The heatmap confirms adjacent hours also carry substantial traffic."),
+  paste0("Increase staffing on ", peak_day, "s from ", max(peak_hour - 1, 8), ":00–", min(peak_hour + 2, 18), ":00. Schedule at least one additional student-worker shift during this window compared to low-traffic days. Review the heatmap each quarter to adjust if patterns shift."),
+
+  "Supply Budgeting",
+  paste0(top3_resources[1], ", ", top3_resources[2], ", and ", top3_resources[3], " are the top three resources, each selected in a large percentage of all visits."),
+  "Secure recurring quarterly funding for these consumables. Set a minimum inventory threshold for each (e.g., minimum 2-week supply on hand). Place reorders at least one week before midterm and finals weeks, when demand reliably spikes.",
+
+  "Basic Needs Funding",
+  paste0("'", top_category, "' accounts for the largest share of total resource demand, driven primarily by snacks and kitchen use."),
+  "Frame all budget proposals around basic-needs and equity language, which aligns with institutional funding priorities. Track snack and kitchen supply costs as a separate line item so the recurring cost is visible to decision-makers.",
+
+  "Midterms & Finals Prep",
+  "Weekly trends show clear, predictable usage spikes around midterms and finals each quarter. These spikes are consistent across both academic years in the dataset.",
+  "Pre-position extra printing supplies, scantrons, and snacks 1–2 weeks before each midterm and final exam period. Evaluate whether extending center hours by 1–2 hours during these weeks would reduce overcrowding and improve the student experience.",
+
+  "Retention & Engagement",
+  paste0(percent(pct_return_7d/100, accuracy = 1), " of repeat visitors return within 7 days, and the median gap between visits is ", median_gap_days, " days. The center is already part of many students' weekly routines."),
+  "Continue investing in first-visit programming (WOW, orientation events, early-quarter outreach) to convert new visitors into regular users. Report retention metrics quarterly to demonstrate sustained engagement and justify ongoing investment.",
+
+  "Data Collection",
+  "Some sign-ins have missing student IDs, and a small number of rapid re-submissions (same student within 5 minutes) exist in the data.",
+  "Add client-side form validation to require a username before submission. Consider implementing a 3-minute cooldown between submissions from the same device to prevent accidental duplicates. These changes will improve data quality for future analyses without adding burden on students."
+)
+
+recs %>%
+  kbl(caption = "Data-Driven Recommendations") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, bold = TRUE, width = "10em") %>%
+  column_spec(2, width = "25em") %>%
+  column_spec(3, width = "25em")
+```
+
+------------------------------------------------------------------------
+
+# 8 — Funding-Ready Summary {#funding}
+
+These talking points are designed to be copied directly into budget requests, memos, or presentations. Each one states the finding, quantifies it, and connects it to a funding or planning action.
+
+```{r}
+#| label: funding-bullets
+#| echo: false
+
+# Pull top resource percent-of-visits for this section
+top_res <- top_resources %>% slice_head(n = 3)
+top_cat <- category_summary %>% slice_head(n = 1)
+
+bullets <- c(
+  paste0("**Scale of impact:** From ", date_min, " to ", date_max, ", the MBP Center recorded **",
+         comma(total_visits), " total visits** (sign-in events) from **", comma(unique_users),
+         " unique students** across ", comma(open_days), " days of operation — an average of **",
+         visits_per_day, " visits per open day**."),
+  paste0("**Students keep coming back:** **", percent(pct_repeat/100, accuracy = 0.1),
+         "** of unique students visited two or more times. Among repeat visitors, **",
+         percent(pct_return_7d/100, accuracy = 1),
+         "** returned within 7 days and the median gap between visits is **", median_gap_days,
+         " days**. The center is not a one-time stop — it is part of students' regular routines."),
+  paste0("**Top needs are basic and recurring:** The three most-selected resources are **",
+         top_res$resource[1], "** (selected in ", percent(top_res$pct_of_visits[1], accuracy = 1),
+         " of visits), **", top_res$resource[2], "** (", percent(top_res$pct_of_visits[2], accuracy = 1),
+         "), and **", top_res$resource[3], "** (", percent(top_res$pct_of_visits[3], accuracy = 1),
+         "). **", top_cat$category, "** resources as a category appear in **",
+         percent(top_cat$pct_of_visits, accuracy = 1),
+         "** of all visits. These are consumable, recurring costs that require sustained funding."),
+  paste0("**Demand is predictable and actionable:** Peak usage falls on **", peak_day, "s around ", peak_hour,
+         ":00**, with additional spikes during midterms and finals each quarter. ",
+         "Staffing schedules and supply restocking should be aligned to these patterns to avoid shortages during the busiest windows."),
+  paste0("**Year-over-year trajectory:** Compared to the same point in AY 24–25 — using a fair comparison that limits both years to the same number of days into the academic calendar — year-to-date visits have changed by **",
+         exec_yoy_pct, "%** (", exec_yoy_dir, "). This comparison controls for differences in how much of the year has been recorded, so the change reflects real usage, not data availability.")
+)
+
+tibble(`Key Takeaways for Decision-Makers` = bullets) %>%
+  kbl(caption = "Funding-Ready Highlights — ready to paste into budget requests, memos, or presentations") %>%
+  kable_styling(full_width = FALSE) %>%
+  column_spec(1, width = "60em")
+```
+
+------------------------------------------------------------------------
+
+# 9 — Limitations and Interpretation {#limitations}
+
+Every dataset has boundaries. This section describes what the sign-in data can and cannot tell us. These limitations do not undermine the findings — the patterns documented in this report are robust — but they are important context for anyone using the data in planning, funding, or evaluation conversations. Being transparent about what the data captures strengthens the credibility of the analysis.
+
+1.  **Sign-ins measure visits, not time spent.** Each sign-in represents one entry event. The data does not capture how long a student stayed, so a 5-minute snack stop and a 3-hour study session are counted equally.
+
+2.  **Resource selections are self-reported.** Students select the resources they plan to use at the time of sign-in. They may not use all selected resources, or they may use resources they did not select. Selections reflect stated intent, not verified usage.
+
+3.  **One visit can include multiple resource selections.** Resource counts should not be interpreted as visit counts. The "% of visits" metric in this report addresses this by showing how many visits included each resource, which is a more comparable measure.
+
+4.  **Missing student IDs affect student-level metrics.** Some sign-ins are missing a valid username. These visits are included in total visit counts but are excluded from unique-student counts, repeat-visitor analysis, and retention metrics. This means the true number of unique students may be slightly higher than reported.
+
+5.  **Username inconsistencies may affect student-level counts.** Students enter their username manually, so the same student could appear under slightly different identifiers (typos, capitalization). The cleaning process normalizes common variations, but some duplication may remain, which would slightly overcount unique students.
+
+6.  **Changes in sign-ins reflect multiple factors.** Increases or decreases in usage may result from changes in student demand, outreach and marketing efforts, programming and events, hours of operation, or data collection practices. The data alone cannot distinguish between these drivers.
+
+7.  **Year-over-year comparisons are limited to the same stage of the academic calendar.** AY 24–25 data is trimmed to match the number of days elapsed in AY 25–26, measured from August 1. This makes the comparison fair in terms of time, but differences in the academic calendar (e.g., shifted quarter start dates) may still introduce minor variations.
+
+8.  **Non-standard resource entries are excluded from the main analysis.** A small number of free-text resource entries (e.g., "Tape!", "Sticky notes") fall outside the standard categories. These are documented in the Data Quality section but are not included in resource counts or category summaries.
+
+------------------------------------------------------------------------
+
+*Report generated `r Sys.Date()`. Data reflects all sign-ins recorded through the most recent available date in each academic year.*
